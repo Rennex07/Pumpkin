@@ -25,8 +25,6 @@ pub struct Weather {
     pub old_rain_level: f32,
     pub thunder_level: f32,
     pub old_thunder_level: f32,
-
-    pub weather_cycle_enabled: bool,
 }
 
 impl Default for Weather {
@@ -48,7 +46,6 @@ impl Weather {
             old_rain_level: 0.0,
             thunder_level: 0.0,
             old_thunder_level: 0.0,
-            weather_cycle_enabled: true,
         }
     }
 
@@ -78,24 +75,35 @@ impl Weather {
     }
 
     pub fn tick_weather(&mut self, world: &World) {
-        if !self.weather_cycle_enabled {
-            self.advance_weather_cycle();
-        }
+        // Vanilla `ServerLevel.advanceWeatherCycle` reads the `advance_weather`
+        // game rule every tick, so a change applies without a restart.
+        let advance_weather = world.level_info.load().game_rules.advance_weather;
 
-        // Update visual transitions
-        self.old_rain_level = self.rain_level;
-        self.old_thunder_level = self.thunder_level;
+        // Vanilla wraps both the cycle and the level interpolation in
+        // `canHaveWeather`, so a dimension without sky light never rolls into
+        // rain and its levels stay frozen. The broadcasts stay outside the gate:
+        // with the levels frozen the old and new values stay equal, so nothing
+        // is sent for such a dimension anyway.
+        if world.can_have_weather() {
+            if advance_weather {
+                self.advance_weather_cycle(world);
+            }
 
-        if self.raining {
-            self.rain_level = (self.rain_level + WEATHER_TRANSITION_SPEED).min(1.0);
-        } else {
-            self.rain_level = (self.rain_level - WEATHER_TRANSITION_SPEED).max(0.0);
-        }
+            // Update visual transitions
+            self.old_rain_level = self.rain_level;
+            self.old_thunder_level = self.thunder_level;
 
-        if self.thundering {
-            self.thunder_level = (self.thunder_level + WEATHER_TRANSITION_SPEED).min(1.0);
-        } else {
-            self.thunder_level = (self.thunder_level - WEATHER_TRANSITION_SPEED).max(0.0);
+            if self.raining {
+                self.rain_level = (self.rain_level + WEATHER_TRANSITION_SPEED).min(1.0);
+            } else {
+                self.rain_level = (self.rain_level - WEATHER_TRANSITION_SPEED).max(0.0);
+            }
+
+            if self.thundering {
+                self.thunder_level = (self.thunder_level + WEATHER_TRANSITION_SPEED).min(1.0);
+            } else {
+                self.thunder_level = (self.thunder_level - WEATHER_TRANSITION_SPEED).max(0.0);
+            }
         }
 
         // Broadcast level changes if needed
@@ -114,8 +122,8 @@ impl Weather {
         }
     }
 
-    fn advance_weather_cycle(&mut self) {
-        // Removed async since there are no await calls
+    fn advance_weather_cycle(&mut self, world: &World) {
+        let was_raining = self.raining;
         if self.clear_weather_time > 0 {
             self.clear_weather_time -= 1;
             self.thunder_time = i32::from(!self.thundering);
@@ -148,10 +156,23 @@ impl Weather {
                 self.rain_time = rand::rng().random_range(RAIN_DELAY_MIN..=RAIN_DELAY_MAX);
             }
         }
+
+        // Vanilla broadcasts the rain state whenever the natural cycle flips it,
+        // otherwise clients never learn that it started or stopped raining.
+        if was_raining != self.raining {
+            if was_raining {
+                world.broadcast_packet_all(&CGameEvent::new(GameEvent::EndRaining, 0.0));
+            } else {
+                world.broadcast_packet_all(&CGameEvent::new(GameEvent::BeginRaining, 0.0));
+            }
+        }
     }
 
     pub fn reset_weather_cycle(&mut self, world: &World) {
-        self.set_weather_parameters(world, 0, 0, false, false);
+        // Vanilla `ServerLevel.resetWeatherCycle` only clears the rain and thunder
+        // state; it leaves `clear_weather_time` alone, so sleeping through the
+        // night must not cancel an active `/weather clear <duration>`.
+        self.set_weather_parameters(world, self.clear_weather_time, 0, false, false);
     }
 }
 
@@ -167,7 +188,6 @@ impl Clone for Weather {
             old_rain_level: self.old_rain_level,
             thunder_level: self.thunder_level,
             old_thunder_level: self.old_thunder_level,
-            weather_cycle_enabled: self.weather_cycle_enabled,
         }
     }
 }

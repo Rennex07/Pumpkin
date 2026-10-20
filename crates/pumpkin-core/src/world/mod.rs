@@ -898,6 +898,14 @@ impl World {
         }
     }
 
+    /// Vanilla `Level.canHaveWeather`: only sky-lit dimensions without a ceiling
+    /// get weather, and the End never does.
+    pub fn can_have_weather(&self) -> bool {
+        self.dimension.has_skylight
+            && !self.dimension.has_ceiling
+            && self.dimension.minecraft_name != Dimension::THE_END.minecraft_name
+    }
+
     pub fn set_game_rule(&self, rule: &GameRule, value: GameRuleValue<i64, bool>) {
         let current_info = self.level_info.load();
         let mut new_info = (**current_info).clone();
@@ -1928,16 +1936,15 @@ impl World {
             (level_time.is_night(), level_time.time_of_day)
         };
 
-        let (should_reset_weather, weather_cycle_enabled) = {
+        let should_reset_weather = {
             let mut weather = self
                 .weather
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             weather.tick_weather(self);
-            (
-                weather.raining || weather.thundering,
-                weather.weather_cycle_enabled,
-            )
+            // Vanilla `Level.isRaining`: the rain level has to be above the
+            // threshold, not just the raining flag set.
+            weather.rain_level > 0.2
         };
 
         if self.should_skip_night() && is_night {
@@ -1956,7 +1963,10 @@ impl World {
                 player.wake_up();
             }
 
-            if weather_cycle_enabled && should_reset_weather {
+            // Vanilla `ServerLevel.tick`: sleeping through the night resets the
+            // weather cycle, but only while the `advance_weather` rule is on.
+            let advance_weather = self.level_info.load().game_rules.advance_weather;
+            if advance_weather && should_reset_weather {
                 let mut weather = self
                     .weather
                     .lock()
