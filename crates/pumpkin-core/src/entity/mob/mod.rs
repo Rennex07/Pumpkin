@@ -558,7 +558,12 @@ impl MobEntity {
         }
 
         let current_brightness = if is_thundering {
-            (sky_light - 10).max(block_light)
+            // Vanilla `LevelLightEngine.getRawBrightness` subtracts the sky
+            // darkening from the sky light, which can go negative, and then takes
+            // the maximum with the block light.
+            i32::from(sky_light)
+                .saturating_sub(10)
+                .max(i32::from(block_light)) as u8
         } else {
             sky_light.max(block_light)
         };
