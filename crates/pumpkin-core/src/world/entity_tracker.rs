@@ -3,11 +3,11 @@ use std::sync::atomic::{
     AtomicBool, AtomicU32,
     Ordering::{self, Relaxed},
 };
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use bytes::BufMut;
 use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
-use dashmap::DashSet;
 use pumpkin_data::entity::EntityType;
 use pumpkin_data::packet::CURRENT_MC_VERSION;
 use pumpkin_protocol::bedrock::client::CSetActorMotion;
@@ -65,13 +65,57 @@ impl MoveSync {
     }
 }
 
+/// The players that can currently see a tracked entity.
+///
+/// This is a plain `FxHashSet` behind a lock rather than a `DashSet`. A
+/// `DashSet` eagerly allocates a shard array of `shard_count * 128` bytes,
+/// which is 4 KiB per tracked entity on an 8-core machine, even though the
+/// set only ever holds the UUIDs of the players nearby.
+#[derive(Debug, Default)]
+pub struct SeenBy(RwLock<FxHashSet<Uuid>>);
+
+impl SeenBy {
+    /// Returns whether the given player can see the entity.
+    pub fn contains(&self, uuid: &Uuid) -> bool {
+        self.read().contains(uuid)
+    }
+
+    /// Adds a player, returning whether they were not in the set before.
+    pub fn insert(&self, uuid: Uuid) -> bool {
+        self.write().insert(uuid)
+    }
+
+    /// Removes a player, returning whether they were in the set.
+    pub fn remove(&self, uuid: &Uuid) -> bool {
+        self.write().remove(uuid)
+    }
+
+    /// Returns whether no player can see the entity.
+    pub fn is_empty(&self) -> bool {
+        self.read().is_empty()
+    }
+
+    /// Forgets every player.
+    pub fn clear(&self) {
+        self.write().clear();
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, FxHashSet<Uuid>> {
+        self.0.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, FxHashSet<Uuid>> {
+        self.0.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 pub struct TrackedEntity {
     pub entity: Arc<dyn EntityBase>,
     pub entity_id: i32,
     pub tracking_range: u32,
     pub update_interval: u32,
     pub track_deltas: bool,
-    pub seen_by: DashSet<Uuid>,
+    pub seen_by: SeenBy,
     /// Bedrock players in `seen_by`.
     bedrock_watchers: AtomicU32,
     pub last_section_pos: AtomicCell<Vector3<i32>>,
@@ -119,7 +163,7 @@ impl TrackedEntity {
             tracking_range: range,
             update_interval,
             track_deltas,
-            seen_by: DashSet::new(),
+            seen_by: SeenBy::default(),
             bedrock_watchers: AtomicU32::new(0),
             last_section_pos: AtomicCell::new(last_section_pos),
             tick_count: AtomicU32::new(0),
@@ -639,7 +683,7 @@ impl TrackedEntity {
 
     /// Vanilla `TrackedEntity.removePlayer`: despawn on the client, only if it was paired.
     pub fn remove_player(&self, player: &Player) {
-        if self.seen_by.remove(&player.gameprofile.id).is_some() {
+        if self.seen_by.remove(&player.gameprofile.id) {
             if matches!(player.client.as_ref(), ClientPlatform::Bedrock(_)) {
                 self.bedrock_watchers.fetch_sub(1, Relaxed);
             }
@@ -649,7 +693,7 @@ impl TrackedEntity {
 
     /// Forgets the player as a viewer without a removal packet; the client already dropped it.
     pub fn forget_player(&self, player: &Player) {
-        if self.seen_by.remove(&player.gameprofile.id).is_some()
+        if self.seen_by.remove(&player.gameprofile.id)
             && matches!(player.client.as_ref(), ClientPlatform::Bedrock(_))
         {
             self.bedrock_watchers.fetch_sub(1, Relaxed);
